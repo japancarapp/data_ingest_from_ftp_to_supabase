@@ -3,8 +3,9 @@
 MySQL dump → Supabase ETL pipeline.
 
 Authentication: NONE — uses a single OneDrive "Anyone with link" shared
-folder URL. Microsoft's Graph API accepts a base64-encoded share URL as
-a driveItem identifier, no Azure app registration required.
+folder URL. Files are discovered by fetching the folder page and extracting
+the embedded JSON manifest OneDrive injects into every shared folder page.
+No Graph API, no Microsoft account needed.
 
 Strategy: truncate + full reload on every run.
 """
@@ -12,7 +13,7 @@ Strategy: truncate + full reload on every run.
 import os
 import re
 import sys
-import base64
+import json
 import logging
 import requests
 import psycopg2
@@ -26,7 +27,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ONEDRIVE_FOLDER_URL = os.environ["ONEDRIVE_FOLDER_URL"]  # The single shared folder link
+ONEDRIVE_FOLDER_URL = os.environ["ONEDRIVE_FOLDER_URL"]
 SUPABASE_DB_URL     = os.environ["SUPABASE_DB_URL"]
 
 
@@ -34,11 +35,11 @@ def _safe_db_url(url: str) -> str:
     """Return the DB URL with the password replaced by *** for safe logging."""
     return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", url)
 
-# Only process files matching this pattern (safeguard against unrelated files)
+
+# Only process files matching this pattern
 SQL_FILE_PATTERN = re.compile(r"^auct_.*\.sql$", re.IGNORECASE)
 
-# Maps filename → primary key column(s)
-# Add entries here if new dump files are added to the folder later
+# Maps filename -> primary key column(s)
 PRIMARY_KEYS = {
     "auct_auctions_xml.sql":  ["id"],
     "auct_lots_xml_jp.sql":   ["id"],
@@ -48,79 +49,133 @@ PRIMARY_KEYS = {
     "auct_results_xml.sql":   ["result_id"],
 }
 
-# ── OneDrive shared-folder helpers (no auth needed) ───────────────────────────
+# ── OneDrive shared-folder helpers ────────────────────────────────────────────
 
-def _resolve_share_url(share_url: str) -> str:
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+
+def list_files_in_shared_folder(share_url: str) -> list:
     """
-    Resolve a short OneDrive URL (1drv.ms) to its full URL by following
-    redirects without downloading the page. This is needed because newer
-    1drv.ms/f/c/... links must be resolved before base64-encoding.
+    List files in a public OneDrive shared folder.
+
+    Fetches the folder page and extracts the JSON manifest that OneDrive
+    embeds in every shared folder page. Contains file names and pre-signed
+    download URLs. No Graph API or Microsoft login needed.
     """
-    if "1drv.ms" in share_url:
-        resp = requests.head(share_url, allow_redirects=True, timeout=15)
-        resolved = resp.url
-        log.debug(f"Resolved short URL to: {resolved}")
-        return resolved
-    return share_url
+    log.info("Fetching OneDrive shared folder page ...")
+    resp = requests.get(share_url, headers=HEADERS, timeout=30, allow_redirects=True)
 
-
-def _share_url_to_encoded_id(share_url: str) -> str:
-    """
-    Convert a OneDrive/SharePoint share URL to the base64 token format
-    that Microsoft Graph accepts as a sharing token.
-
-    Documented at:
-    https://learn.microsoft.com/en-us/graph/api/shares-get
-    """
-    resolved = _resolve_share_url(share_url)
-    b64 = base64.b64encode(resolved.encode("utf-8")).decode("utf-8")
-    b64 = b64.rstrip("=").replace("/", "_").replace("+", "-")
-    return f"u!{b64}"
-
-
-def list_files_in_shared_folder(share_url: str) -> list[dict]:
-    """
-    List all items inside a shared OneDrive folder using the
-    anonymous Graph sharing API — no token required.
-
-    Returns list of dicts with keys: name, downloadUrl
-    """
-    token = _share_url_to_encoded_id(share_url)
-    # This endpoint is publicly accessible for "Anyone with link" shares
-    url = f"https://graph.microsoft.com/v1.0/shares/{token}/driveItem/children"
-
-    resp = requests.get(url, timeout=30)
-
-    if resp.status_code == 401:
-        raise PermissionError(
-            "OneDrive returned 401. Make sure the folder is shared as "
-            "'Anyone with the link can view' (not restricted to specific people). "
-            "Check the ONEDRIVE_FOLDER_URL secret is correct."
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Could not open shared folder (HTTP {resp.status_code}). "
+            "Check ONEDRIVE_FOLDER_URL is correct and shared as 'Anyone with link'."
         )
-    if resp.status_code == 404:
-        raise FileNotFoundError(
-            "OneDrive folder not found (404). Double-check the ONEDRIVE_FOLDER_URL secret."
-        )
-    resp.raise_for_status()
 
-    items = resp.json().get("value", [])
+    html = resp.text
+
+    # OneDrive embeds file data as a JSON blob in a <script> tag.
+    # Try several known patterns across different OneDrive versions.
+
+    # Pattern A: items array directly in page JS
+    m = re.search(r'"items"\s*:\s*(\[.+?\])\s*[,}]', html, re.DOTALL)
+    if m:
+        try:
+            items = json.loads(m.group(1))
+            files = _extract_files(items)
+            if files:
+                log.info(f"Found {len(files)} file(s) via pattern A")
+                return files
+        except Exception:
+            pass
+
+    # Pattern B: __odSpPageContextInfo or similar JSON object containing items
+    m = re.search(r'({[^<]*"items"\s*:\s*\[.+?\]})\s*[;,<]', html, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            items = data.get("items", [])
+            files = _extract_files(items)
+            if files:
+                log.info(f"Found {len(files)} file(s) via pattern B")
+                return files
+        except Exception:
+            pass
+
+    # Pattern C: data-manifiest attribute
+    m = re.search(r'data-manifest="([^"]+)"', html)
+    if m:
+        try:
+            items = json.loads(m.group(1).replace("&quot;", '"'))
+            files = _extract_files(items if isinstance(items, list) else items.get("items", []))
+            if files:
+                log.info(f"Found {len(files)} file(s) via pattern C")
+                return files
+        except Exception:
+            pass
+
+    # Pattern D: large JSON blob — find all objects with a "name" and download URL
+    files = _extract_from_json_blobs(html)
+    if files:
+        log.info(f"Found {len(files)} file(s) via pattern D")
+        return files
+
+    raise RuntimeError(
+        "Could not find file list in the OneDrive page. "
+        "The folder share link may have expired — try regenerating it."
+    )
+
+
+def _extract_files(items: list) -> list:
+    """Pull name + downloadUrl from a list of OneDrive item dicts."""
     files = []
     for item in items:
-        if "file" in item:  # skip subfolders
-            files.append({
-                "name": item["name"],
-                "downloadUrl": item.get("@microsoft.graph.downloadUrl", ""),
-            })
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name", "")
+        url = (
+            item.get("@content.downloadUrl")
+            or item.get("downloadUrl")
+            or item.get("url")
+            or ""
+        )
+        # Skip folders (they have no download URL or have a childCount key)
+        if name and url and "folder" not in item:
+            files.append({"name": name, "downloadUrl": url})
+    return files
 
-    log.info(f"Found {len(files)} file(s) in shared folder: {[f['name'] for f in files]}")
+
+def _extract_from_json_blobs(html: str) -> list:
+    """
+    Last-resort: scan the page for any JSON object that has both
+    a 'name' ending in .sql and a download URL field.
+    """
+    files = []
+    seen = set()
+    for m in re.finditer(r'\{[^{}]{20,}\}', html):
+        try:
+            obj = json.loads(m.group(0))
+            name = obj.get("name", "")
+            url = obj.get("@content.downloadUrl") or obj.get("downloadUrl") or ""
+            if name and url and name not in seen and SQL_FILE_PATTERN.match(name):
+                files.append({"name": name, "downloadUrl": url})
+                seen.add(name)
+        except Exception:
+            pass
     return files
 
 
 def download_file(download_url: str, name: str) -> bytes:
-    resp = requests.get(download_url, timeout=60)
+    resp = requests.get(download_url, headers=HEADERS, timeout=60, allow_redirects=True)
     resp.raise_for_status()
     log.info(f"  Downloaded {name} ({len(resp.content):,} bytes)")
     return resp.content
+
 
 # ── SQL dump parser ───────────────────────────────────────────────────────────
 
@@ -163,7 +218,7 @@ def _split_row(row_str: str) -> list:
     return [_parse_value(t) for t in tokens]
 
 
-def parse_columns(sql_text: str) -> list[str]:
+def parse_columns(sql_text: str) -> list:
     m = re.search(
         r"CREATE TABLE\s+`?[\w]+`?\s*\((.*?)\)\s*ENGINE",
         sql_text, re.DOTALL | re.IGNORECASE,
@@ -179,16 +234,16 @@ def parse_columns(sql_text: str) -> list[str]:
     return cols
 
 
-def parse_dump(sql_bytes: bytes) -> tuple[list[str], list[tuple]]:
+def parse_dump(sql_bytes: bytes) -> tuple:
     sql_text = sql_bytes.decode("utf-8", errors="replace")
     columns = parse_columns(sql_text)
     rows = []
     for m in _INSERT_RE.finditer(sql_text):
-        # Match individual row tuples: (v1, v2, ...)
         for rm in re.finditer(r"\(([^()]*(?:'[^']*'[^()]*)*)\)", m.group(1)):
             rows.append(tuple(_split_row(rm.group(1))))
     log.info(f"  Parsed {len(rows)} rows, {len(columns)} columns: {columns}")
     return columns, rows
+
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
 
@@ -198,13 +253,12 @@ def infer_pg_type(val) -> str:
     return "TEXT"
 
 
-def truncate_and_load(conn, table: str, columns: list[str], pk: list[str], rows: list[tuple]):
+def truncate_and_load(conn, table: str, columns: list, pk: list, rows: list):
     if not rows:
         log.warning(f"  No rows to load into '{table}' — skipping truncate.")
         return
 
     with conn.cursor() as cur:
-        # Auto-create table if it doesn't exist yet
         col_defs  = [f'"{c}" {infer_pg_type(v)}' for c, v in zip(columns, rows[0])]
         pk_clause = ", ".join(f'"{c}"' for c in pk)
         cur.execute(
@@ -212,8 +266,6 @@ def truncate_and_load(conn, table: str, columns: list[str], pk: list[str], rows:
             + ",\n".join(f"  {d}" for d in col_defs)
             + f",\n  PRIMARY KEY ({pk_clause})\n);"
         )
-
-        # Full reload
         cur.execute(f'TRUNCATE TABLE "{table}";')
         col_list = ", ".join(f'"{c}"' for c in columns)
         execute_values(
@@ -223,12 +275,13 @@ def truncate_and_load(conn, table: str, columns: list[str], pk: list[str], rows:
             page_size=500,
         )
         conn.commit()
-    log.info(f"  ✓ {len(rows)} rows loaded into '{table}'")
+    log.info(f"  {len(rows)} rows loaded into '{table}'")
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("=== MySQL → Supabase sync (truncate + reload) ===")
+    log.info("=== MySQL -> Supabase sync (truncate + reload) ===")
     errors = []
 
     # 1. Discover files in the shared OneDrive folder
@@ -236,22 +289,19 @@ def main():
     sql_files = [f for f in all_files if SQL_FILE_PATTERN.match(f["name"])]
 
     if not sql_files:
-        log.error("No matching .sql files found in the shared folder. Aborting.")
+        log.error("No matching auct_*.sql files found in the shared folder. Aborting.")
         sys.exit(1)
 
-    # Warn about any expected files that are missing
     found_names = {f["name"] for f in sql_files}
     for expected in PRIMARY_KEYS:
         if expected not in found_names:
-            log.warning(f"Expected file not found in folder: {expected}")
+            log.warning(f"Expected file not present this run: {expected}")
 
     # 2. Connect to Supabase
-    log.info(f"Connecting to Supabase at {_safe_db_url(SUPABASE_DB_URL)} …")
+    log.info(f"Connecting to Supabase at {_safe_db_url(SUPABASE_DB_URL)} ...")
     try:
         conn = psycopg2.connect(SUPABASE_DB_URL)
     except psycopg2.OperationalError as e:
-        # psycopg2 sometimes includes the DSN (with password) in the error message.
-        # Sanitize it before logging.
         safe_err = re.sub(r"password=[^\s]+", "password=***", str(e))
         log.error(f"Could not connect to Supabase: {safe_err}")
         sys.exit(1)
@@ -260,18 +310,18 @@ def main():
     # 3. Process each file
     for file in sql_files:
         name  = file["name"]
-        table = name.replace(".sql", "")  # filename minus extension = table name
+        table = name.replace(".sql", "")
         pk    = PRIMARY_KEYS.get(name)
 
         if not pk:
             log.warning(f"No primary key configured for '{name}' — skipping. "
-                        f"Add it to PRIMARY_KEYS in sync.py to include it.")
+                        "Add it to PRIMARY_KEYS in sync.py to include it.")
             continue
 
-        log.info(f"--- {name} → {table} ---")
+        log.info(f"--- {name} -> {table} ---")
         try:
-            raw              = download_file(file["downloadUrl"], name)
-            columns, rows    = parse_dump(raw)
+            raw           = download_file(file["downloadUrl"], name)
+            columns, rows = parse_dump(raw)
             if not columns:
                 raise ValueError("Could not parse column names — check CREATE TABLE is present in dump")
             truncate_and_load(conn, table, columns, pk, rows)
@@ -286,7 +336,7 @@ def main():
         log.error(f"Finished WITH ERRORS: {errors}")
         sys.exit(1)
 
-    log.info("=== All done ✓ ===")
+    log.info("=== All done ===")
 
 
 if __name__ == "__main__":
