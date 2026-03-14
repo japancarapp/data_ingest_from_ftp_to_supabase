@@ -1,10 +1,9 @@
-name: MySQL Dumps → Supabase Sync
+name: MySQL Dumps -> Supabase Sync
 
 on:
   schedule:
-    # Every hour at :10 past — buffer time for OneDrive to finish writing
     - cron: "10 * * * *"
-  workflow_dispatch: # Manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -27,10 +26,5 @@ jobs:
 
       - name: Run sync
         env:
-          ONEDRIVE_FOLDER_URL: ${{ secrets.ONEDRIVE_FOLDER_URL }}
-          SUPABASE_DB_URL:     ${{ secrets.SUPABASE_DB_URL }}
-        run: python scripts/debug.py
-
-      - name: Report failure
-        if: failure()
-        run: echo "::error::Sync failed — check the logs above for which file errored."
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/sync.py
