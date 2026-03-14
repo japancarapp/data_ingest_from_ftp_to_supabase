@@ -29,7 +29,7 @@ jobs:
         env:
           ONEDRIVE_FOLDER_URL: ${{ secrets.ONEDRIVE_FOLDER_URL }}
           SUPABASE_DB_URL:     ${{ secrets.SUPABASE_DB_URL }}
-        run: python scripts/sync.py
+        run: python scripts/debug.py
 
       - name: Report failure
         if: failure()
