@@ -1,0 +1,36 @@
+name: MySQL Dumps → Supabase Sync
+
+on:
+  schedule:
+    # Every hour at :10 past — buffer time for OneDrive to finish writing
+    - cron: "10 * * * *"
+  workflow_dispatch: # Manual trigger from the Actions tab
+
+jobs:
+  sync:
+    name: Truncate & reload auction tables
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run sync
+        env:
+          ONEDRIVE_FOLDER_URL: ${{ secrets.ONEDRIVE_FOLDER_URL }}
+          SUPABASE_DB_URL:     ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/sync.py
+
+      - name: Report failure
+        if: failure()
+        run: echo "::error::Sync failed — check the logs above for which file errored."
