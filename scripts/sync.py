@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 ONEDRIVE_FOLDER_URL = os.environ["ONEDRIVE_FOLDER_URL"]  # The single shared folder link
 SUPABASE_DB_URL     = os.environ["SUPABASE_DB_URL"]
 
+
+def _safe_db_url(url: str) -> str:
+    """Return the DB URL with the password replaced by *** for safe logging."""
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", url)
+
 # Only process files matching this pattern (safeguard against unrelated files)
 SQL_FILE_PATTERN = re.compile(r"^auct_.*\.sql$", re.IGNORECASE)
 
@@ -45,6 +50,20 @@ PRIMARY_KEYS = {
 
 # ── OneDrive shared-folder helpers (no auth needed) ───────────────────────────
 
+def _resolve_share_url(share_url: str) -> str:
+    """
+    Resolve a short OneDrive URL (1drv.ms) to its full URL by following
+    redirects without downloading the page. This is needed because newer
+    1drv.ms/f/c/... links must be resolved before base64-encoding.
+    """
+    if "1drv.ms" in share_url:
+        resp = requests.head(share_url, allow_redirects=True, timeout=15)
+        resolved = resp.url
+        log.debug(f"Resolved short URL to: {resolved}")
+        return resolved
+    return share_url
+
+
 def _share_url_to_encoded_id(share_url: str) -> str:
     """
     Convert a OneDrive/SharePoint share URL to the base64 token format
@@ -53,8 +72,8 @@ def _share_url_to_encoded_id(share_url: str) -> str:
     Documented at:
     https://learn.microsoft.com/en-us/graph/api/shares-get
     """
-    # Encode the URL to unpadded base64, prefixed with "u!"
-    b64 = base64.b64encode(share_url.encode("utf-8")).decode("utf-8")
+    resolved = _resolve_share_url(share_url)
+    b64 = base64.b64encode(resolved.encode("utf-8")).decode("utf-8")
     b64 = b64.rstrip("=").replace("/", "_").replace("+", "-")
     return f"u!{b64}"
 
@@ -75,11 +94,12 @@ def list_files_in_shared_folder(share_url: str) -> list[dict]:
     if resp.status_code == 401:
         raise PermissionError(
             "OneDrive returned 401. Make sure the folder is shared as "
-            "'Anyone with the link can view' (not restricted to specific people)."
+            "'Anyone with the link can view' (not restricted to specific people). "
+            "Check the ONEDRIVE_FOLDER_URL secret is correct."
         )
     if resp.status_code == 404:
         raise FileNotFoundError(
-            "OneDrive folder not found. Double-check the ONEDRIVE_FOLDER_URL secret."
+            "OneDrive folder not found (404). Double-check the ONEDRIVE_FOLDER_URL secret."
         )
     resp.raise_for_status()
 
@@ -226,8 +246,15 @@ def main():
             log.warning(f"Expected file not found in folder: {expected}")
 
     # 2. Connect to Supabase
-    log.info("Connecting to Supabase …")
-    conn = psycopg2.connect(SUPABASE_DB_URL)
+    log.info(f"Connecting to Supabase at {_safe_db_url(SUPABASE_DB_URL)} …")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URL)
+    except psycopg2.OperationalError as e:
+        # psycopg2 sometimes includes the DSN (with password) in the error message.
+        # Sanitize it before logging.
+        safe_err = re.sub(r"password=[^\s]+", "password=***", str(e))
+        log.error(f"Could not connect to Supabase: {safe_err}")
+        sys.exit(1)
     log.info("Connected.")
 
     # 3. Process each file
